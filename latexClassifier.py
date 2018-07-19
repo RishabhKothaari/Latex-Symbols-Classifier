@@ -2,219 +2,226 @@ import os
 import torch
 from torch.optim import lr_scheduler
 import torch.nn as nn
-from torch.utils.data.dataset import Dataset
+from torchvision import transforms, datasets
+from torch.utils.data.sampler import SubsetRandomSampler
 import torch.utils.data as Data
 import torchvision
 from PIL import Image
-import pandas
 import numpy
-import matplotlib.pyplot
+from torchvision.utils import make_grid
+import matplotlib.pyplot as plt
 import torch.optim as optim
 import math
+import time
 
 print(torch.__version__)
 print(torchvision.__version__)
 
-symbolsMap = pandas.read_csv('./data/csv/symbolsMap.csv')
-classesMap = {}
-for row in symbolsMap.itertuples(index=True):
-    classesMap[getattr(row, 'Symbols')] = getattr(row, 'Index')
-# end
-testResults, trainResults = [], []
-preprocessInput = torchvision.transforms.Compose(
-    [torchvision.transforms.ToTensor()])
+
+DigitsImagesFolder = "./digits/"
+testAccuracy = []
 """
-Training dataset loader
+Image transforms
+"""
+trainTransform = torchvision.transforms.Compose([
+    torchvision.transforms.Grayscale(num_output_channels=1),
+    torchvision.transforms.Resize(size=(32, 32)),
+    torchvision.transforms.ToTensor()
+])
+
+trainInverseTransform = torchvision.transforms.Compose([
+    torchvision.transforms.ToPILImage()
+])
+
+"""
+Show samples in a grid
+img: list of images.
 """
 
 
-class trainDataset(Dataset):
-    def __init__(self, trainSetPath):
-        data_info = pandas.read_csv(trainSetPath)
-        self.images = numpy.array(data_info.iloc[:, 0], dtype=str)
-        labels = numpy.array(data_info.iloc[:, 2])
-        self.labels = numpy.array(labels)
-    # end
-
-    def __getitem__(self, index):
-        imagePath = self.images[index]
-        label = self.labels[index]
-        return imagePath, label
-    # end
-
-    def __len__(self):
-        return len(self.images)
+def show(img):
+    npimg = img.numpy()
+    plt.imshow(numpy.transpose(npimg, (1, 2, 0)), interpolation='nearest')
+    plt.show()
 # end
 
 
 """
-Testset data loader
+Load the data folder and prepare training set and testing set
+dataFolder: directory containing the images
+showImage: show sample while preparing training and resting set
+ratio: training to test split ratio
+shuffle: shuffle example
 """
 
 
-class testDataset(Dataset):
-    def __init__(self, trainSetPath):
-        data_info = pandas.read_csv(trainSetPath)
-        self.images = numpy.array(data_info.iloc[:, 0], dtype=str)
-        labels = numpy.array(data_info.iloc[:, 2])
-        self.labels = numpy.array(labels)
+def getDataLoader(dataFolder=DigitsImagesFolder, showImages=False, ratio=0.25, shuffle=False):
+    trainDataset = datasets.ImageFolder(
+        root=dataFolder, transform=trainTransform)
+    testDataset = datasets.ImageFolder(
+        root=dataFolder, transform=trainTransform)
+    numTrain = len(trainDataset)
+    indices = list(range(numTrain))
+    split = int(numpy.floor(ratio * numTrain))
+    print("num train - ", numTrain)
+
+    if shuffle:
+        numpy.random.shuffle(indices)
     # end
 
-    def __getitem__(self, index):
-        imagePath = self.images[index]
-        label = self.labels[index]
-        return imagePath, label
+    trainIdx, testIdx = indices[split:], indices[:split]
+    trainSampler = SubsetRandomSampler(trainIdx)
+    testSampler = SubsetRandomSampler(testIdx)
+    trainLoader = torch.utils.data.DataLoader(trainDataset,
+                                              batch_size=128, sampler=trainSampler,
+                                              num_workers=4)
+    testLoader = torch.utils.data.DataLoader(testDataset,
+                                             batch_size=128, sampler=testSampler,
+                                             num_workers=4)
+    if showImages:
+        sampleLoader = torch.utils.data.DataLoader(
+            trainDataset, batch_size=4, shuffle=shuffle, num_workers=1)
+        sampleIter = iter(sampleLoader)
+        imageBatch = sampleIter.next()
+        print("image type - ", type(imageBatch[0]))
+        show(make_grid(imageBatch[0]))
+        print('Ground Truth :', ' '.join('%5s' % label.item()
+                                         for label in imageBatch[1]))
     # end
-
-    def __len__(self):
-        return len(self.images)
+    return (trainLoader, testLoader)
 # end
 
 
 """
-Convolutional Neural Network
+Convolution Neural Network
 """
 
 
-class Net(nn.Module):
+class Network(nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = torch.nn.Conv2d(3, 32, kernel_size=(3, 3))
-        self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=(3, 3))
-        self.prelu1 = torch.nn.PReLU()
-        self.prelu2 = torch.nn.PReLU()
-        self.tanh = torch.nn.Tanh()
-        self.fc1 = torch.nn.Linear(12544, 1024)
-        self.fc2 = torch.nn.Linear(1024, 369)
-    # end
+        super(Network, self).__init__()
+        self.conv1 = torch.nn.Conv2d(1, 8, kernel_size=3)
+        self.conv1_bn = torch.nn.BatchNorm2d(8)
+        self.conv2 = torch.nn.Conv2d(8, 16, kernel_size=3)
+        self.conv2_bn = torch.nn.BatchNorm2d(16)
+        self.conv3 = torch.nn.Conv2d(16, 32, kernel_size=3)
+        self.conv3_bn = torch.nn.BatchNorm2d(32)
+        self.fc1 = torch.nn.Linear(576, 128)
+        self.fc2 = torch.nn.Linear(128, 10)
+        self.tanh = nn.Tanh()
+        self.prelu = nn.PReLU()
+        # end
 
     def forward(self, x):
         x = self.conv1(x)
-        x = self.prelu1(x)
+        x = self.prelu(x)
+        x = torch.nn.functional.max_pool2d(x, kernel_size=2)
         x = self.conv2(x)
-        x = self.prelu2(x)
-        x = torch.nn.functional.max_pool2d(x, kernel_size=(2, 2))
-        x = torch.nn.functional.dropout(x, p=0.25, training=self.training)
+        x = self.prelu(x)
+        x = torch.nn.functional.max_pool2d(x, kernel_size=2)
         x = x.view(-1, self.num_flat_features(x))
+        x = nn.functional.dropout(x, p=0.25, training=self.training)
         x = self.fc1(x)
-        x = self.tanh(x)
-        x = torch.nn.functional.dropout(x, p=0.5, training=self.training)
+        x = nn.functional.dropout(x, p=0.5, training=self.training)
         x = self.fc2(x)
+        x = self.tanh(x)
         return torch.nn.functional.log_softmax(x, dim=1)
-    # end
+        # end
 
     def num_flat_features(self, x):
         size = x.size()[1:]  # all dimensions except the batch dimension
+        # print("size - ", size)
         num_features = 1
         for s in size:
             num_features *= s
         return num_features
     # end
+# end
 
 
-net = Net().cuda()
-
-print("network", net)
-
-
-def getLabel(label):
-    label = str(label[0])
-    index = classesMap.get(label)
-    return torch.FloatTensor([index]).long()
-
-
-# SGD optimizer
-optimizer = torch.optim.SGD(params=net.parameters(), lr=0.001, momentum=0.9)
-# Apdaptive learning scheduler
-ap_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-
-# training data
-trainData = trainDataset('./data/csv/train.csv')
-# load the training data
-trainLoader = Data.DataLoader(trainData, batch_size=128, shuffle=True)
-digitsData = testDataset('./data/csv/digits-test.csv')
-# load test data
-testLoader = Data.DataLoader(digitsData, batch_size=128, shuffle=True)
-
-print("done loading sets")
-
-print("len 1", trainLoader.__len__())
-print("len 2", testLoader.__len__())
-
-"""Implement training phase"""
+"""
+Train the model.
+model: model
+trainSet: training images
+device: cuda or cpu
+optimizer: Adam
+epoch: epoch number
+"""
 
 
-def train(optimizer, scheduler):
-    net.train()
-    scheduler.step()
-    for n, sample in enumerate(trainLoader):
-        imagePath, label = sample
-        image = preprocessInput(Image.open(imagePath[0]))
-        image = torch.autograd.Variable(
-            image, requires_grad=False, volatile=False).cuda()
-        label = torch.autograd.Variable(
-            getLabel(label), requires_grad=False, volatile=False).cuda()
-        image = image.unsqueeze(0)
+def train(model, trainSet, device, optimizer, epoch):
+    model.train()
+    for batchId, (tensorInput, tensorTarget) in enumerate(trainSet):
+        inputData, label = tensorInput.to(device), tensorTarget.to(device)
         optimizer.zero_grad()
-        estimate = net(image)
-        loss = torch.nn.functional.nll_loss(input=estimate, target=label)
-        loss.backward()
+        output = model(inputData)
+        trainLoss = nn.functional.nll_loss(output, label)
+        trainLoss.backward()
         optimizer.step()
+
+        if batchId % 10 == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batchId * len(inputData), len(trainSet.dataset),
+                100. * batchId / len(trainSet), trainLoss.item()))
     # end
 # end
 
 
-"""Implement testing phase""""
+"""Test the model.
+    model : model
+    testSet: test data
+    device: cuda or cpu
+    optimizer: Adam
+    epoch: epoch number
+"""
 
 
-def test(optimizer):
-    net.eval()
-    train, test = 0, 0
-    for n, sample in enumerate(trainLoader):
-        imagePath, label = sample
-        image = preprocessInput(Image.open(imagePath[0]))
-        image = torch.autograd.Variable(
-            image, requires_grad=False, volatile=False).cuda()
-        label = torch.autograd.Variable(
-            getLabel(label), requires_grad=False, volatile=False).cuda()
-        image = image.unsqueeze(0)
-        estimate = net(image)
-        train = train + \
-            estimate.data.max(dim=1, keepdim=False)[1].eq(label.data).sum()
+def test(model, testSet, device, optimizer, epoch):
+    model.eval()
+    testLoss = 0
+    correctPredictions = 0
+    with torch.no_grad():
+        for tensorInput, tensorTaget in testSet:
+            inputData, label = tensorInput.to(device), tensorTaget.to(device)
+            output = model(inputData)
+            testLoss = testLoss + \
+                nn.functional.nll_loss(
+                    output, label, size_average=False).item()
+            prediction = output.max(1, keepdim=True)[1]
+            correctPredictions = correctPredictions + \
+                prediction.eq(label.view_as(prediction)).sum().item()
+        # end
     # end
-    for n, sample in enumerate(testLoader):
-        imagePath, label = sample
-        image = preprocessInput(Image.open(imagePath[0]))
-        image = torch.autograd.Variable(
-            image, requires_grad=False, volatile=False).cuda()
-        label = torch.autograd.Variable(
-            getLabel(label), requires_grad=False, volatile=False).cuda()
-        image = image.unsqueeze(0)
-        estimate = net(image)
-        test = test + estimate.data.max(dim=1,
-                                        keepdim=False)[1].eq(label.data).sum()
-    # end
-    trainResults.append(100.0 * train / trainLoader.__len__())
-    testResults.append(100.0 * test / testLoader.__len__())
-
-    print('')
-    print('train: ' + str(train) + '/' + str(trainLoader.__len__()) +
-          ' (' + str(trainResults[-1]) + '%)')
-    print('validation: ' + str(test) + '/' +
-          str(testLoader.__len__()) + ' (' + str(testResults[-1]) + '%)')
-    print('')
+    testLoss = testLoss / len(testSet.dataset)
+    print('\nEpoch:{}, Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        epoch, testLoss, correctPredictions, len(testSet.dataset), 100. * correctPredictions / len(testSet.dataset)))
+    testAccuracy.append(100. * correctPredictions / len(testSet.dataset))
 # end
 
 
-for i in range(100):
-    print("epoch :", i)
-    print("training start")
-    train(optimizer, ap_lr_scheduler)
-    print("testing start")
-    test(optimizer)
-# end
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = Network().to(device)
+    print("model - ", model)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-08)
+    trainSet, testSet = getDataLoader(
+        showImages=True, ratio=0.75, shuffle=True)
+    print("train set length - ", len(trainSet))
+    print("test set length - ", len(testSet))
 
-matplotlib.pyplot.figure(figsize=(4.0, 5.0), dpi=150.0)
-matplotlib.pyplot.plot(trainResults)
-matplotlib.pyplot.plot(testResults)
-matplotlib.pyplot.show()
+    for epoch in range(20):
+        train(model, trainSet, device, optimizer, epoch)
+        test(model, testSet, device, optimizer, epoch)
+    # end
+
+    plt.figure(figsize=(4.0, 5.0), dpi=150.0)
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Accuracy as a function of number of epochs')
+    plt.legend(loc='lower right')
+    plt.plot(testAccuracy)
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
